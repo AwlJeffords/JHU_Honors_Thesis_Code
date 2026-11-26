@@ -1,0 +1,326 @@
+#install.packages("phytools")
+#install.packages("ape")
+#install.packages("vegan")
+#install.packages("MCMCglmm")
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(phytools)
+library(ape)
+library(RColorBrewer)
+library(vegan)
+
+set.seed(123)
+
+setwd("~/Desktop/Honors Thesis")
+
+# Cleaning Up the Data ====
+
+# Reads the CSV file
+krat_df <- read.csv("K Rat Master.csv")
+
+# Remove non-Dipodomys specimens
+krat_df <- krat_df %>%
+  filter(grepl("^D\\.", Species))
+
+# Separates the MamMeasurements Column
+krat_df <- krat_df %>%
+  mutate (
+    # Sets "No Measurements" to NA
+    MamMeasurements_clean = ifelse(
+      trimws(MamMeasurements) == "No measurements",
+      NA,
+      MamMeasurements
+    ),
+    # Code out any bracketing conventions
+    MamMeasurements_clean = gsub("\\]\\s*-\\s*\\[", "-", MamMeasurements_clean),
+    MamMeasurements_clean = gsub("\\[|\\]|\\([^)]*\\)", "", MamMeasurements_clean),
+    # Replace any stand-ins to NA so they are converted to numeric later
+    MamMeasurements_clean = gsub("(?<=^|-)X(?=-|$)", NA_character_,
+                                 MamMeasurements_clean, perl = TRUE)
+  ) %>%
+  separate(
+    MamMeasurements_clean,
+    into = c("total_length_mm", "tail_length_mm", "foot_length_mm", "ear_length_mm"),
+    sep = "-",
+    convert = TRUE, # auto-converts to numeric
+    extra = "warn", # warn if more than 4 fields appear
+    fill = "right" # fill NAs from the right if fewer than 4 fields
+  ) %>%
+  mutate(across(c(total_length_mm, tail_length_mm, foot_length_mm, ear_length_mm), as.numeric))
+
+# Making Analyzeable Data ====
+
+# Average out the lengths
+krat_avg <- krat_df %>%
+  group_by(Specimen.ID) %>%
+  mutate(Species = word(Species, 1, 2)) %>%
+  filter(Species != "D. UNKNOWN") %>%
+  summarise(
+    # Keep one value of metadata columns
+    across(c(Species, Sex..M.F., County, flag, mojave_sonoran_basin), first),
+    # Average only the true L/R measurements
+    across(c(Femur.Length..mm., Tibia.Length..mm., Fibula.Length..mm., Calcaneus.Extention.Length..mm.,
+             Total.Calcaneus.Length..mm., Calcaneus.Tip.to.Metatarsal.Tip.Length..mm.,
+             Longest.Metatarsal.Length..mm.),
+           ~ mean(.x, na.rm = TRUE)),
+    # Keep single-value columns (same for both rows)
+    across(c(total_length_mm, tail_length_mm, foot_length_mm, ear_length_mm,
+             MamWeightG, LatCentroidLatitudeDec_tab, LatCentroidLongitudeDec_tab), first),
+    .groups = "drop"
+  )
+
+# PCA Process ====
+## Log-Transform for PCA ====
+
+# Select the measurement columns
+pca_cols <- c("Femur.Length..mm.", "Tibia.Length..mm.", "Fibula.Length..mm.", 
+              "Calcaneus.Extention.Length..mm.", "Total.Calcaneus.Length..mm.",
+              "Calcaneus.Tip.to.Metatarsal.Tip.Length..mm.", 
+              "Longest.Metatarsal.Length..mm.")
+
+# Select body measurement columns that will not go into the PCA
+body_cols <- c("total_length_mm", "tail_length_mm", "foot_length_mm", "ear_length_mm")
+
+# Drop rows with any NA in the columns
+pca_data <- krat_avg %>%
+  select(Specimen.ID, Sex..M.F., Species, mojave_sonoran_basin, all_of(pca_cols),
+         all_of(body_cols)) 
+
+# Log-transform the measurements
+pca_log <- pca_data %>%
+  mutate(across(all_of(pca_cols), log)) %>%
+  drop_na(all_of(pca_cols))
+
+## Interlude: Phylogenetic Analysis ====
+
+# Read in the tree
+tree <- read.tree("kangaroo rats_species.nwk")
+
+# Convert tree tips to abbreviated format
+tree$tip.label <- gsub("Dipodomys_", "D. ", tree$tip.label)
+
+# Check tree tips and our data
+tree$tip.label
+unique(pca_log$Species)
+
+# Prune the tree only to species in your dataset
+species_list <- unique(pca_log$Species)
+tree <- keep.tip(tree, species_list)
+
+# Plot the tree
+plot(tree)
+
+## Phylogenetic PCA ====
+
+# Ensure that all species are accounted for 
+# and there are no mismatches
+setdiff(species_list, tree$tip.label)
+setdiff(tree$tip.label, species_list)
+
+# Create species-level matrix (for pPCA)
+species_matrix <- pca_log %>%
+  group_by(Species) %>%
+  summarise(across(all_of(pca_cols), ~ mean(.x, na.rm = TRUE))) %>%
+  column_to_rownames("Species") %>%
+  as.matrix()
+
+# Run pPCA on species averages
+ppca_result <- phyl.pca(tree, species_matrix, method = "BM", mode = "cov")
+
+# Project specimen level data onto the pPCA space
+specimen_matrix <- pca_log %>%
+  column_to_rownames("Specimen.ID") %>%
+  select(all_of(pca_cols)) %>%
+  as.matrix()
+
+# Center the specimen matrix using phylogenetic means
+specimen_matrix_centered <- sweep(specimen_matrix, 2, ppca_result$a, "-")
+
+# Project into pPC space using eigenvectors
+specimen_scores <- specimen_matrix_centered %*% ppca_result$Evec
+
+summary(specimen_scores)
+
+# Convert specimen scores to a dataframe & add metadata if possible
+specimen_scores_df <- as.data.frame(specimen_scores) %>%
+  mutate(Specimen.ID = rownames(specimen_matrix_centered)) %>%
+  left_join(pca_log %>% select(Specimen.ID, Species, mojave_sonoran_basin),
+            by = "Specimen.ID")
+
+# Extract variance explained from ppca on specimen-level scores
+specimen_var <- apply(specimen_scores, 2, var)
+variance_explained <- specimen_var / sum(specimen_var) * 100
+cumulative_variance <- cumsum(variance_explained)
+
+# Create table to show explained results
+variance_table <- data.frame(
+  PC = paste0("PC", 1:7),
+  Variance_Explained = round(variance_explained, 2),
+  Cumulative_Variance = round(cumulative_variance, 2)
+)
+print(variance_table)
+
+# Extract loadings for all PCs
+loadings_table <- as.data.frame(ppca_result$L)
+print(loadings_table)
+
+# Extract loadings for just PC1 & PC2
+loadings_PC1_PC2 <- as.data.frame(ppca_result$L[, 1:2])
+print(loadings_PC1_PC2)
+
+# Plotting PCA ====
+
+my_colors = c("#ED3624", "#A400C7", "#006FFF", "#00733B", "#F1C40F", 
+              "#7A6CAF", "#14C7DE", "#2FDA77", "#CB670E", "#EC41C8",
+              "#993232", "#6F714E", "#091360")
+
+## Species ====
+
+ggplot(specimen_scores_df, aes(x = PC1, y = PC2, color = Species)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = my_colors) +
+  theme_classic() +
+  labs(x = "PC1", y = "PC2", color = "Species") +
+  theme(
+    axis.text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18)
+  )
+
+## Substrate ====
+
+specimen_scores_df <- specimen_scores_df %>%
+  mutate(desert_group = case_when(
+    mojave_sonoran_basin == "mojave"  ~ "Mojave",
+    mojave_sonoran_basin == "sonoran" ~ "Sonoran",
+    mojave_sonoran_basin == "basin"   ~ "Great Basin",
+    TRUE ~ "Other/Unknown"
+  )) %>%
+  mutate(desert_group = factor(desert_group, 
+                               levels = c("Great Basin", "Mojave", "Sonoran", "Other/Unknown")))
+
+my_colors <- c("Mojave" = "#E69F00", "Sonoran" = "#56B4E9", 
+               "Great Basin" = "#009E73", "Other/Unknown" = "gray70")
+
+ggplot(specimen_scores_df, aes(x = PC1, y = PC2, color = desert_group)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = my_colors) +
+  theme_classic() +
+  labs(x = "PC1", y = "PC2", color = "Desert") +
+  theme(
+    axis.text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18)
+  )
+
+# Statistics and Analytics ====
+
+## PERMANOVA ====
+
+### With Other/Unknown ====
+
+# Test species alone
+permanova_spp <- adonis2(specimen_scores ~ Species,
+                         data = specimen_scores_df,
+                         permutations = 9999,
+                         method = "euclidean")
+
+print(permanova_spp)
+
+# Test desert alone
+permanova_dsrt <- adonis2(specimen_scores ~ desert_group,
+                          data = specimen_scores_df,
+                          permutations = 9999,
+                          method = "euclidean")
+
+print(permanova_dsrt)
+
+# Test the interaction
+permanova_both <- adonis2(specimen_scores ~ Species + desert_group,
+                     data = specimen_scores_df,
+                     permutations = 9999,
+                     method = "euclidean",
+                     by = "term")
+
+print(permanova_both)
+
+### Without Other/Unknown ====
+
+# Filter out any unknown sampling locations
+specimen_scores_df_known <- specimen_scores_df %>%
+  filter(desert_group != "Other/Unknown")
+
+# Test species alone
+permanova_spp_known <- adonis2(specimen_scores[specimen_scores_df$desert_group != "Other/Unknown", ]
+                               ~ Species,
+                         data = specimen_scores_df_known,
+                         permutations = 9999,
+                         method = "euclidean")
+
+print(permanova_spp_known)
+
+# Test desert alone
+permanova_dsrt_known <- adonis2(specimen_scores[specimen_scores_df$desert_group != "Other/Unknown", ]
+                                ~ desert_group,
+                          data = specimen_scores_df_known,
+                          permutations = 9999,
+                          method = "euclidean")
+
+print(permanova_dsrt_known)
+
+# Test the interaction
+permanova_both_known <- adonis2(specimen_scores[specimen_scores_df$desert_group != "Other/Unknown", ]
+                                ~ Species + desert_group,
+                          data = specimen_scores_df_known,
+                          permutations = 9999,
+                          method = "euclidean",
+                          by = "term")
+
+print(permanova_both_known)
+
+specimen_scores_df_known %>% count(Species)
+
+## ANOVA for D. merriami exclusively ====
+
+anova_data <- specimen_scores_df_known %>%
+  select(Specimen.ID, Species, desert_group, PC1, PC2) %>%
+  mutate(animal = Species) %>%
+  filter(Species == "D. merriami")
+
+anova_data %>% count(desert_group)
+
+# ANOVA on PC1
+anova1 <- aov(PC1 ~ desert_group, data = anova_data)
+summary(anova1)
+
+# ANOVA on PC2
+anova2 <- aov(PC2 ~ desert_group, data = anova_data)
+summary(anova2)
+
+  # Since PC1 is significant,
+# Run Tukey post-hoc to determine differences
+TukeyHSD(anova1)
+
+# Rework order to keep consistency
+anova_data <- anova_data %>%
+  mutate(desert_group = factor(desert_group, 
+                               levels = c("Mojave", "Great Basin", "Sonoran")))
+
+# Plotting Merriami to demonstrate ANOVA results
+ggplot(anova_data, aes(x = desert_group, y = PC1, fill = desert_group)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 1.5, alpha = 0.6) +
+  scale_fill_manual(values = c("Great Basin" = "#009E73", "Mojave" = "#E69F00", "Sonoran" = "#56B4E9")) +
+  theme_classic() +
+  labs(x = "Desert", y = "PC1") +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        plot.title = element_text(size = 18))
+
+
+
